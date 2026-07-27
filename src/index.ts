@@ -1,5 +1,6 @@
 import {
   Env,
+  Account,
   listAccounts,
   getBalance,
   listPots,
@@ -8,10 +9,20 @@ import {
   startOfCalendarDay,
   recentSpendDays,
   recentMonzoSpendDays,
+  recentSpendWeeks,
+  recentMonzoSpendWeeks,
   spendDayLabel,
+  spendWeekLabel,
   Transaction,
 } from "./monzo.js";
 import { applyMoneyBack, isCardPayment } from "./money-back.js";
+import {
+  amountForCategory,
+  bucketByCategory,
+  bucketTotals,
+  categoryRows,
+  totalByCategory,
+} from "./buckets.js";
 
 /**
  * Small proxy between the iPhone widget and Monzo.
@@ -39,8 +50,14 @@ export default {
           return await handleSummary(request, url, env);
         case "/week":
           return await handleWeek(request, url, env);
+        case "/weeks":
+          return await handleWeeks(request, url, env);
         case "/pots":
           return await handlePots(request, url, env);
+        case "/accounts":
+          return await handleAccounts(request, url, env);
+        case "/version":
+          return handleVersion();
         case "/diagnose":
           return await handleDiagnose(request, url, env);
         default:
@@ -59,11 +76,69 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+/**
+ * Bump this whenever the widgets start needing something older Workers do not
+ * serve. Each user runs their own copy of this Worker and updates it on their
+ * own schedule, so a widget can easily be newer than the Worker it is talking
+ * to. Without a version to compare, that shows up as a bare 404 from a route
+ * that simply did not exist yet, which tells the user nothing.
+ *
+ *   1  the original /summary, /week and /pots widgets
+ *   2  adds /weeks, plus category breakdowns on /week
+ */
+const WORKER_VERSION = 2;
+
+/**
+ * Deliberately unauthenticated: the installer needs to tell "your Worker is
+ * old" apart from "your widget key is wrong", and it cannot do that if the
+ * version check is itself behind the key. Nothing here is private — the
+ * landing page already identifies this as a Monzo Widgets Worker.
+ */
+function handleVersion(): Response {
+  return new Response(
+    JSON.stringify({ service: "monzo-widgets", version: WORKER_VERSION }),
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      },
+    }
+  );
+}
+
+const INSTALLER_URL =
+  "https://raw.githubusercontent.com/alixkyle/monzo-widgets/main/widget/money-installer.js";
+
+function escapeHtml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+/**
+ * Safari cannot reliably "Save to Files" a raw .js URL into Scriptable's iCloud
+ * folder, so the page offers the installer as copyable text instead. Returns
+ * null when GitHub is unreachable; the page then falls back to a plain link.
+ */
+async function fetchInstaller(): Promise<string | null> {
+  try {
+    const res = await fetch(INSTALLER_URL, {
+      cf: { cacheTtl: 3600, cacheEverything: true },
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
 async function handleHome(url: URL, env: Env): Promise<Response> {
   const callback = `${url.origin}/auth/callback`;
-  const installer =
-    "https://raw.githubusercontent.com/alixkyle/monzo-widgets/main/widget/money-installer.js";
-  const connected = Boolean(await env.MONZO.get("refresh_token"));
+  const [connected, installerSource] = await Promise.all([
+    env.MONZO.get("refresh_token").then(Boolean),
+    fetchInstaller(),
+  ]);
   const nonce = crypto.randomUUID().replaceAll("-", "");
 
   return new Response(
@@ -91,6 +166,7 @@ async function handleHome(url: URL, env: Env): Promise<Response> {
     .copy-row input { min-width: 0; font-size: .78rem; }
     .copy-row button { width: auto; white-space: nowrap; }
     form input { margin-bottom: .75rem; }
+    textarea { box-sizing: border-box; width: 100%; height: 7rem; margin: .75rem 0; border: 0; border-radius: .7rem; padding: .7rem; background: #f7f5f2; color: #001e3a; font-family: ui-monospace, Menlo, monospace; font-size: .7rem; white-space: pre; }
     button, a.button { display: block; background: #ff4f40; color: white; font-weight: 700; text-align: center; text-decoration: none; }
     button.copied { background: #4bb78f; }
     a { color: #69d2ae; }
@@ -129,8 +205,18 @@ async function handleHome(url: URL, env: Env): Promise<Response> {
 
   <section class="step">
     <span class="step-number">4</span><h2>Install the iPhone widgets</h2>
-    <p>After Monzo is connected, open the installer and save it to Scriptable.</p>
-    <a class="button" href="${installer}">Open iPhone installer</a>
+    ${
+      installerSource
+        ? `<p>After Monzo is connected, copy the installer and paste it into Scriptable.</p>
+    <textarea id="installer-source" readonly>${escapeHtml(installerSource)}</textarea>
+    <button type="button" data-copy="installer-source">Copy installer script</button>
+    <small>Then open Scriptable, tap the blue <strong>+</strong> at the top right,
+    paste, and name the script <strong>Monzo Installer</strong>. Run it with the
+    triangular play button.</small>`
+        : `<p>The installer could not be loaded just now. Open this link, copy everything,
+    then paste it into a new Scriptable script.</p>
+    <a class="button" href="${INSTALLER_URL}">Open iPhone installer</a>`
+    }
   </section>
   <script nonce="${nonce}">
     document.querySelectorAll("[data-copy]").forEach((button) => {
@@ -154,12 +240,81 @@ async function handleHome(url: URL, env: Env): Promise<Response> {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Content-Security-Policy":
-          `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
+          // auth.monzo.com must be listed: browsers apply form-action to the
+          // whole redirect chain, so 'self' alone silently blocks the 302 that
+          // /auth issues towards Monzo and the button appears to do nothing.
+          `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; form-action 'self' https://auth.monzo.com; base-uri 'none'; frame-ancestors 'none'`,
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
       },
     }
   );
+}
+
+function isCurrentAccount(account: Account): boolean {
+  return account.type === "uk_retail" || account.type === "uk_retail_joint";
+}
+
+/** "Joint account", or the Monzo description when there are several of a kind. */
+function accountLabel(account: Account, accounts: Account[]): string {
+  const kind =
+    account.type === "uk_retail_joint" ? "Joint account" : "Personal account";
+  const sameKind = accounts.filter((a) => a.type === account.type);
+  return sameKind.length > 1 ? `${kind} — ${account.description}` : kind;
+}
+
+/**
+ * Which current account the widgets read.
+ *
+ * `wanted` is an account id, or "personal"/"joint" so a widget can be pinned to
+ * a kind of account without knowing its id. With nothing chosen, this falls
+ * back to the first current account Monzo returns — for anyone holding a joint
+ * account that is usually, but not always, the personal one.
+ *
+ * An unresolvable choice returns undefined rather than falling back, so a stale
+ * id surfaces as an error instead of quietly showing the wrong account's money.
+ */
+function pickAccount(
+  accounts: Account[],
+  wanted: string | null
+): Account | undefined {
+  const current = accounts.filter(isCurrentAccount);
+  const choice = wanted?.trim();
+  if (!choice) return current[0];
+  if (choice === "joint") {
+    return current.find((a) => a.type === "uk_retail_joint");
+  }
+  if (choice === "personal") {
+    return current.find((a) => a.type === "uk_retail");
+  }
+  return current.find((a) => a.id === choice);
+}
+
+const NO_ACCOUNT =
+  "No matching current account. Open Monzo Settings on your iPhone and choose " +
+  "the account again.";
+
+/** Lets Monzo Settings show a picker without hard-coding account ids. */
+async function handleAccounts(
+  request: Request,
+  url: URL,
+  env: Env
+): Promise<Response> {
+  if (!authorised(request, url, env)) {
+    return json({ error: "Unauthorised" }, 401);
+  }
+
+  const accounts = await listAccounts(env);
+  const current = accounts.filter(isCurrentAccount);
+  return json({
+    accounts: current.map((account) => ({
+      id: account.id,
+      type: account.type,
+      label: accountLabel(account, current),
+      joint: account.type === "uk_retail_joint",
+    })),
+    defaultId: current[0]?.id ?? null,
+  });
 }
 
 /** Compares without leaking which character differed via response timing. */
@@ -326,17 +481,6 @@ function hasAnyWeekCategory(t: Transaction, categories: Set<string>): boolean {
   return transactionCategories(t).some((category) => categories.has(category));
 }
 
-/** Amount assigned to one Monzo category, respecting split transactions. */
-function amountForWeekCategory(t: Transaction, category: string): number {
-  const split = Object.entries(t.categories ?? {}).find(
-    ([name]) => name.toLowerCase() === category
-  );
-  if (split) return split[1];
-
-  const primary = (t.category ?? t.merchant?.category)?.toLowerCase();
-  return primary === category ? t.amount : 0;
-}
-
 /**
  * Money back that should reduce spending: card refunds, and friends paying
  * back their share. Wages and other income use different schemes (bacs,
@@ -380,24 +524,6 @@ function withoutInternalTransfers(
   });
 }
 
-/** Totals per spend day, oldest first. Amounts stay signed, as Monzo sends. */
-function bucketByDay(transactions: Transaction[], dayStarts: Date[]): number[] {
-  const totals = new Array(dayStarts.length).fill(0);
-
-  for (const tx of transactions) {
-    const at = Date.parse(tx.created);
-    // Walk backwards to find the newest day boundary at or before this txn.
-    for (let i = dayStarts.length - 1; i >= 0; i--) {
-      if (at >= dayStarts[i].getTime()) {
-        totals[i] += tx.amount;
-        break;
-      }
-    }
-  }
-
-  return totals;
-}
-
 async function handlePots(
   request: Request,
   url: URL,
@@ -408,10 +534,8 @@ async function handlePots(
   }
 
   const accounts = await listAccounts(env);
-  const main = accounts.find(
-    (a) => a.type === "uk_retail" || a.type === "uk_retail_joint"
-  );
-  if (!main) return json({ error: "No current account found" }, 404);
+  const main = pickAccount(accounts, url.searchParams.get("account"));
+  if (!main) return json({ error: NO_ACCOUNT }, 404);
   const flexAccount = accounts.find((a) => a.type === "uk_monzo_flex");
 
   const [balance, pots, flexBalance] = await Promise.all([
@@ -444,69 +568,91 @@ async function handlePots(
   );
 }
 
-async function handleWeek(
-  request: Request,
-  url: URL,
-  env: Env
-): Promise<Response> {
-  if (!authorised(request, url, env)) {
-    return json({ error: "Unauthorised" }, 401);
-  }
+interface SpendOptions {
+  account: string | null;
+  categoryFilter: Set<string>;
+  excludedCategories: Set<string>;
+  includeFlex: boolean;
+  useMonzoDay: boolean;
+  splitRepayments: "original" | "ignore";
+  unlinkedIncoming: "ignore" | "received";
+  cardRefunds: "original" | "received" | "ignore";
+  outgoingTransfers: "include" | "exclude" | "spending";
+}
 
-  const accounts = await listAccounts(env);
-  const retail = accounts.find(
-    (a) => a.type === "uk_retail" || a.type === "uk_retail_joint"
-  );
-  if (!retail) return json({ error: "No current account found" }, 404);
-  const flexAccount = accounts.find((a) => a.type === "uk_monzo_flex");
-  const categoryFilter = new Set(
-    (url.searchParams.get("categories") ?? "")
-      .split(",")
-      .map((category) => category.trim().toLowerCase())
-      .filter(Boolean)
-  );
-  const excludedCategories = new Set(
-    (url.searchParams.get("exclude") ?? "bills,savings")
-      .split(",")
-      .map((category) => category.trim().toLowerCase())
-      .filter(Boolean)
-  );
-  const includeFlex = url.searchParams.get("includeFlex") !== "false";
-  const useMonzoDay = url.searchParams.get("dayStart") === "monzo";
-  const splitRepayments =
-    url.searchParams.get("splitRepayments") === "ignore"
-      ? "ignore"
-      : "original";
-  const unlinkedIncoming =
-    url.searchParams.get("unlinkedIncoming") === "received"
-      ? "received"
-      : "ignore";
+/** Every option the spending charts share, defaulted the same way for both. */
+function readSpendOptions(url: URL): SpendOptions {
+  const names = (value: string | null, fallback = "") =>
+    new Set(
+      (value ?? fallback)
+        .split(",")
+        .map((category) => category.trim().toLowerCase())
+        .filter(Boolean)
+    );
+
   const cardRefundParam = url.searchParams.get("cardRefunds");
-  const cardRefunds =
-    cardRefundParam === "received" || cardRefundParam === "ignore"
-      ? cardRefundParam
-      : "original";
   const outgoingTransferParam = url.searchParams.get("outgoingTransfers");
-  const outgoingTransfers =
-    outgoingTransferParam === "exclude" || outgoingTransferParam === "spending"
-      ? outgoingTransferParam
-      : "include";
 
-  // `weeks=1` is the week before last, and so on, so several widgets can sit
-  // in a stack and be swiped between.
-  const weeksAgo = Math.min(
-    52,
-    Math.max(0, Number(url.searchParams.get("weeks")) || 0)
-  );
-  const reference = new Date(Date.now() - weeksAgo * DAYS * 24 * 60 * 60 * 1000);
+  return {
+    account: url.searchParams.get("account"),
+    categoryFilter: names(url.searchParams.get("categories")),
+    excludedCategories: names(url.searchParams.get("exclude"), "bills,savings"),
+    includeFlex: url.searchParams.get("includeFlex") !== "false",
+    useMonzoDay: url.searchParams.get("dayStart") === "monzo",
+    splitRepayments:
+      url.searchParams.get("splitRepayments") === "ignore"
+        ? "ignore"
+        : "original",
+    unlinkedIncoming:
+      url.searchParams.get("unlinkedIncoming") === "received"
+        ? "received"
+        : "ignore",
+    cardRefunds:
+      cardRefundParam === "received" || cardRefundParam === "ignore"
+        ? cardRefundParam
+        : "original",
+    outgoingTransfers:
+      outgoingTransferParam === "exclude" ||
+      outgoingTransferParam === "spending"
+        ? outgoingTransferParam
+        : "include",
+  };
+}
 
-  const dayStarts = useMonzoDay
-    ? recentMonzoSpendDays(DAYS, reference)
-    : recentSpendDays(DAYS, reference);
-  const since = dayStarts[0];
-  // Anything after this window would otherwise land on the final day, since
+interface Spending {
+  currency: string;
+  balance: number;
+  flexBalance: number | null;
+  hasFlex: boolean;
+  card: number[];
+  transfers: number[];
+  flex: number[];
+  bills: number[];
+  savings: number[];
+  categories: Record<string, number>[];
+}
+
+/**
+ * Totals every bucket in `bucketStarts`, which may be days or whole weeks —
+ * the arithmetic is identical either way, only the boundaries differ.
+ *
+ * Returns null when there is no current account to read.
+ */
+async function loadSpending(
+  env: Env,
+  options: SpendOptions,
+  bucketStarts: Date[],
+  reference: Date
+): Promise<Spending | null> {
+  const accounts = await listAccounts(env);
+  const retail = pickAccount(accounts, options.account);
+  if (!retail) return null;
+  const flexAccount = accounts.find((a) => a.type === "uk_monzo_flex");
+
+  const since = bucketStarts[0];
+  // Anything after this window would otherwise land on the final bucket, since
   // bucketing assigns to the newest boundary at or before the timestamp.
-  const until = (useMonzoDay ? startOfSpendDay : startOfCalendarDay)(
+  const until = (options.useMonzoDay ? startOfSpendDay : startOfCalendarDay)(
     new Date(reference.getTime() + 24 * 60 * 60 * 1000)
   ).getTime();
   const inWindow = (t: Transaction) => Date.parse(t.created) < until;
@@ -529,16 +675,16 @@ async function handleWeek(
   // A category-filtered chart shows the selected transactions as Monzo
   // reports them, including savings-pot transfers. The normal chart removes
   // those movements, then excludes bills and savings altogether.
-  const retailReal = categoryFilter.size
-    ? retailTx.filter((t) => hasAnyWeekCategory(t, categoryFilter))
+  const retailReal = options.categoryFilter.size
+    ? retailTx.filter((t) => hasAnyWeekCategory(t, options.categoryFilter))
     : withoutInternalTransfers(retailTx, flexTx).filter(
-        (t) => !hasAnyWeekCategory(t, excludedCategories)
+        (t) => !hasAnyWeekCategory(t, options.excludedCategories)
       );
-  const flexReal = !includeFlex
+  const flexReal = !options.includeFlex
     ? []
-    : categoryFilter.size
-      ? flexTx.filter((t) => hasAnyWeekCategory(t, categoryFilter))
-      : flexTx.filter((t) => !hasAnyWeekCategory(t, excludedCategories));
+    : options.categoryFilter.size
+      ? flexTx.filter((t) => hasAnyWeekCategory(t, options.categoryFilter))
+      : flexTx.filter((t) => !hasAnyWeekCategory(t, options.excludedCategories));
 
   const cardSpend = spendOnly(retailReal).filter(isCardPayment);
   const allTransferSpend = spendOnly(retailReal).filter(
@@ -549,32 +695,38 @@ async function handleWeek(
     "transfers",
     "savings",
   ]);
-  const transferSpend = categoryFilter.size
+  const transferSpend = options.categoryFilter.size
     ? allTransferSpend
-    : outgoingTransfers === "exclude"
+    : options.outgoingTransfers === "exclude"
       ? []
-      : outgoingTransfers === "spending"
+      : options.outgoingTransfers === "spending"
         ? allTransferSpend.filter(
             (t) => !hasAnyWeekCategory(t, nonSpendingTransferCategories)
           )
         : allTransferSpend;
   const flexSpend = spendOnly(flexReal);
 
-  const cardDaily = bucketByDay(cardSpend, dayStarts);
-  const transferDaily = bucketByDay(transferSpend, dayStarts);
-  const flexDaily = bucketByDay(flexSpend, dayStarts);
+  const cardDaily = bucketTotals(cardSpend, bucketStarts);
+  const transferDaily = bucketTotals(transferSpend, bucketStarts);
+  const flexDaily = bucketTotals(flexSpend, bucketStarts);
   const categorySpend = spendOnly([...retailReal, ...flexReal]);
-  const billsDaily = bucketByDay(
+  const billsDaily = bucketTotals(
     categorySpend
-      .map((t) => ({ ...t, amount: amountForWeekCategory(t, "bills") }))
+      .map((t) => ({ ...t, amount: amountForCategory(t, "bills") }))
       .filter((t) => t.amount !== 0),
-    dayStarts
+    bucketStarts
   );
-  const savingsDaily = bucketByDay(
+  const savingsDaily = bucketTotals(
     categorySpend
-      .map((t) => ({ ...t, amount: amountForWeekCategory(t, "savings") }))
+      .map((t) => ({ ...t, amount: amountForCategory(t, "savings") }))
       .filter((t) => t.amount !== 0),
-    dayStarts
+    bucketStarts
+  );
+  // Built from the same transactions the card/transfer/flex totals use, so
+  // the two breakdowns of a bar always add up to the same number.
+  const categoryBuckets = bucketByCategory(
+    [...cardSpend, ...transferSpend, ...flexSpend],
+    bucketStarts
   );
 
   // Refunds and friends' repayments belong to the day of the original
@@ -583,10 +735,15 @@ async function handleWeek(
   const incomingForAdjustment = [...retailReal, ...flexReal].filter(
     (t) =>
       isMoneyBack(t) ||
-      (unlinkedIncoming === "received" &&
+      (options.unlinkedIncoming === "received" &&
         t.amount > 0 &&
         retailReal.some((retailTransaction) => retailTransaction.id === t.id))
   );
+  const moneyBackOptions = {
+    splitRepayments: options.splitRepayments,
+    unlinkedIncoming: options.unlinkedIncoming,
+    cardRefunds: options.cardRefunds,
+  };
   applyMoneyBack(
     incomingForAdjustment,
     [
@@ -594,45 +751,155 @@ async function handleWeek(
       { debits: flexSpend, daily: flexDaily },
       { debits: transferSpend, daily: transferDaily },
     ],
-    dayStarts,
-    { splitRepayments, unlinkedIncoming, cardRefunds }
+    bucketStarts,
+    moneyBackOptions
+  );
+  // The category totals are a separate view of the same money, so they need
+  // the same adjustment applied over their own arrays.
+  applyMoneyBack(
+    incomingForAdjustment,
+    categoryBuckets.map(([, bucket]) => bucket),
+    bucketStarts,
+    moneyBackOptions
   );
 
-  const days = dayStarts.map((start, i) => {
-    const categoryTotal = billsDaily[i] + savingsDaily[i];
-    return {
-      date: start.toISOString(),
-      label: spendDayLabel(start),
-      card: cardDaily[i],
-      transfers: transferDaily[i],
-      flex: flexDaily[i],
-      bills: billsDaily[i],
-      savings: savingsDaily[i],
-      total: categoryFilter.size
-        ? categoryTotal
-        : cardDaily[i] + transferDaily[i] + flexDaily[i],
-    };
+  return {
+    currency: balance.currency,
+    balance: balance.balance,
+    flexBalance: flexBalance ? flexBalance.balance : null,
+    hasFlex: Boolean(flexAccount),
+    card: cardDaily,
+    transfers: transferDaily,
+    flex: flexDaily,
+    bills: billsDaily,
+    savings: savingsDaily,
+    categories: categoryRows(categoryBuckets, bucketStarts.length),
+  };
+}
+
+/**
+ * One bar of a chart. Shared so the daily and weekly endpoints can never
+ * drift apart over what a bar's total means.
+ */
+function spendingBucket(spending: Spending, options: SpendOptions, i: number) {
+  return {
+    card: spending.card[i],
+    transfers: spending.transfers[i],
+    flex: spending.flex[i],
+    bills: spending.bills[i],
+    savings: spending.savings[i],
+    categories: spending.categories[i],
+    total: options.categoryFilter.size
+      ? spending.bills[i] + spending.savings[i]
+      : spending.card[i] + spending.transfers[i] + spending.flex[i],
+  };
+}
+
+function spendingResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    },
   });
+}
 
-  return new Response(
-    JSON.stringify({
-      currency: balance.currency,
-      days,
-      weekTotal: days.reduce((s, d) => s + d.total, 0),
-      hasFlex: Boolean(flexAccount),
-      weeksAgo,
-      // Balances are always current — they aren't rewound for past weeks.
-      balance: balance.balance,
-      flexBalance: flexBalance ? flexBalance.balance : null,
-      updatedAt: new Date().toISOString(),
-    }),
-    {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-      },
-    }
+async function handleWeek(
+  request: Request,
+  url: URL,
+  env: Env
+): Promise<Response> {
+  if (!authorised(request, url, env)) {
+    return json({ error: "Unauthorised" }, 401);
+  }
+
+  const options = readSpendOptions(url);
+
+  // `weeks=1` is the week before last, and so on, so several widgets can sit
+  // in a stack and be swiped between.
+  const weeksAgo = Math.min(
+    52,
+    Math.max(0, Number(url.searchParams.get("weeks")) || 0)
   );
+  const reference = new Date(Date.now() - weeksAgo * DAYS * 24 * 60 * 60 * 1000);
+
+  const dayStarts = options.useMonzoDay
+    ? recentMonzoSpendDays(DAYS, reference)
+    : recentSpendDays(DAYS, reference);
+
+  const spending = await loadSpending(env, options, dayStarts, reference);
+  if (!spending) return json({ error: NO_ACCOUNT }, 404);
+
+  const days = dayStarts.map((start, i) => ({
+    date: start.toISOString(),
+    label: spendDayLabel(start),
+    ...spendingBucket(spending, options, i),
+  }));
+
+  return spendingResponse({
+    currency: spending.currency,
+    days,
+    weekTotal: days.reduce((s, d) => s + d.total, 0),
+    categoryTotals: totalByCategory(spending.categories),
+    hasFlex: spending.hasFlex,
+    weeksAgo,
+    // Balances are always current — they aren't rewound for past weeks.
+    balance: spending.balance,
+    flexBalance: spending.flexBalance,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+const DEFAULT_WEEK_COUNT = 4;
+const MAX_WEEK_COUNT = 12;
+
+/**
+ * The same figures as /week, bucketed into whole rolling weeks instead of
+ * days, so one widget can show a month at a glance.
+ */
+async function handleWeeks(
+  request: Request,
+  url: URL,
+  env: Env
+): Promise<Response> {
+  if (!authorised(request, url, env)) {
+    return json({ error: "Unauthorised" }, 401);
+  }
+
+  const options = readSpendOptions(url);
+  const count = Math.min(
+    MAX_WEEK_COUNT,
+    Math.max(
+      1,
+      Number(url.searchParams.get("count")) || DEFAULT_WEEK_COUNT
+    )
+  );
+  const reference = new Date();
+
+  const weekStarts = options.useMonzoDay
+    ? recentMonzoSpendWeeks(count, reference)
+    : recentSpendWeeks(count, reference);
+
+  const spending = await loadSpending(env, options, weekStarts, reference);
+  if (!spending) return json({ error: NO_ACCOUNT }, 404);
+
+  const weeks = weekStarts.map((start, i) => ({
+    start: start.toISOString(),
+    label: spendWeekLabel(start),
+    latest: i === weekStarts.length - 1,
+    ...spendingBucket(spending, options, i),
+  }));
+
+  return spendingResponse({
+    currency: spending.currency,
+    weeks,
+    periodTotal: weeks.reduce((s, w) => s + w.total, 0),
+    categoryTotals: totalByCategory(spending.categories),
+    hasFlex: spending.hasFlex,
+    balance: spending.balance,
+    flexBalance: spending.flexBalance,
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 /**
@@ -788,10 +1055,8 @@ async function handleSummary(
   }
 
   const accounts = await listAccounts(env);
-  const main = accounts.find(
-    (a) => a.type === "uk_retail" || a.type === "uk_retail_joint"
-  );
-  if (!main) return json({ error: "No current account found" }, 404);
+  const main = pickAccount(accounts, url.searchParams.get("account"));
+  if (!main) return json({ error: NO_ACCOUNT }, 404);
 
   const useMonzoDay = url.searchParams.get("dayStart") === "monzo";
   const since = useMonzoDay ? startOfSpendDay() : startOfCalendarDay();

@@ -219,6 +219,49 @@ export function recentMonzoSpendDays(count: number, now = new Date()): Date[] {
   return days;
 }
 
+/**
+ * The starts of the last `count` rolling seven-day blocks, oldest first.
+ *
+ * Blocks are counted back from today rather than snapped to Mondays, so the
+ * final one covers exactly the same "last 7 days" the weekly chart shows and
+ * the two widgets never disagree about this week's total.
+ */
+function weekStarts(
+  count: number,
+  now: Date,
+  startOf: (date: Date) => Date
+): Date[] {
+  const weeks: Date[] = [];
+  for (let i = count - 1; i >= 0; i--) {
+    const daysBack = i * 7 + 6;
+    weeks.push(startOf(new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000)));
+  }
+  return weeks;
+}
+
+/** The last `count` seven-day blocks on UK calendar days, oldest first. */
+export function recentSpendWeeks(count: number, now = new Date()): Date[] {
+  return weekStarts(count, now, startOfCalendarDay);
+}
+
+/** The last `count` seven-day blocks on Monzo 04:00 days, oldest first. */
+export function recentMonzoSpendWeeks(count: number, now = new Date()): Date[] {
+  return weekStarts(count, now, startOfSpendDay);
+}
+
+/**
+ * A rolling week is named by the day it ends on ("6 Jul"), since it has no
+ * week-commencing Monday to point at.
+ */
+export function spendWeekLabel(start: Date): string {
+  const end = new Date(start.getTime() + 6 * 24 * 60 * 60 * 1000);
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    day: "numeric",
+    month: "short",
+  }).format(end);
+}
+
 /** Midnight at the start of the current Europe/London calendar day. */
 export function startOfCalendarDay(now = new Date()): Date {
   const asUTC = new Date(now.toLocaleString("en-US", { timeZone: "UTC" }));

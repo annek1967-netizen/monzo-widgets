@@ -1,0 +1,91 @@
+# Keeps this Worker up to date with the project it was deployed from.
+#
+# The "Deploy to Cloudflare" button copies the template rather than forking it,
+# so there is no link back to the original and GitHub's "Sync fork" button
+# never appears. Without this workflow a Worker stays frozen on whatever was
+# published the day it was set up, while the iPhone widgets keep updating
+# themselves — and eventually the widgets ask for endpoints the Worker has
+# never heard of.
+#
+# Cloudflare rebuilds automatically whenever this repository changes, so the
+# commit made here is all it takes to redeploy.
+#
+# To update immediately instead of waiting: Actions -> Sync worker from
+# upstream -> Run workflow.
+
+name: Sync worker from upstream
+
+on:
+  schedule:
+    # Just after 06:00 UTC. The offset avoids the top-of-the-hour crowd, when
+    # GitHub delays scheduled jobs the most.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the latest worker
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://codeload.github.com/alixkyle/monzo-widgets/tar.gz/refs/heads/main \
+            -o upstream.tar.gz
+          mkdir upstream
+          tar -xzf upstream.tar.gz -C upstream --strip-components=1
+
+          # Refuse to continue on a partial or unexpected download. Without
+          # this check a failed fetch would let the copy step below delete the
+          # whole Worker and push the result.
+          test -f upstream/worker/src/index.ts
+          test -f upstream/worker/package.json
+
+      - name: Copy it over this repository
+        run: |
+          set -euo pipefail
+
+          # Two deliberate exclusions:
+          #
+          # wrangler.toml holds this Worker's name, which is what its
+          # .workers.dev address is built from. Overwriting it could point
+          # Cloudflare at a different Worker and strand the one the widgets
+          # are configured to call.
+          #
+          # .github is skipped because GITHUB_TOKEN is not allowed to push
+          # changes to workflow files. Including this directory would make
+          # every sync fail outright the first time the workflow itself
+          # changed upstream, which is far worse than it going slightly stale.
+          rsync -a --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'wrangler.toml' \
+            --exclude 'wrangler.local.toml' \
+            --exclude '.dev.vars' \
+            --exclude 'node_modules/' \
+            upstream/worker/ ./
+
+          rm -rf upstream upstream.tar.gz
+
+      - name: Commit and push if anything changed
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Sync worker from alixkyle/monzo-widgets"
+          git push

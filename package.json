@@ -1,5 +1,5 @@
 {
-  "name": "monzo-widgets",
+  "name": "monzo-widgets-worker",
   "version": "0.1.0",
   "private": true,
   "type": "module",
