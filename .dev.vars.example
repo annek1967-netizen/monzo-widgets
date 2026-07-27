@@ -1,0 +1,4 @@
+# Cloudflare's Deploy button asks for these as encrypted Worker secrets.
+MONZO_CLIENT_ID=
+MONZO_CLIENT_SECRET=
+WIDGET_KEY=

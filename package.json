@@ -1,0 +1,33 @@
+{
+  "name": "monzo-widgets",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "node scripts/deploy.mjs",
+    "typecheck": "tsc --noEmit",
+    "tail": "wrangler tail"
+  },
+  "cloudflare": {
+    "bindings": {
+      "MONZO_CLIENT_ID": {
+        "description": "Client ID from your confidential client at developers.monzo.com."
+      },
+      "MONZO_CLIENT_SECRET": {
+        "description": "Client secret from your confidential client at developers.monzo.com."
+      },
+      "WIDGET_KEY": {
+        "description": "Choose a long private password. You will enter the same value in Monzo Settings on your iPhone."
+      },
+      "MONZO": {
+        "description": "Private storage for your rotating Monzo tokens. Cloudflare creates this automatically."
+      }
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260726.1",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.114.0"
+  }
+}

@@ -1,0 +1,8 @@
+name = "monzo-widgets"
+main = "src/index.ts"
+compatibility_date = "2026-07-26"
+
+# Cloudflare automatically creates this KV namespace when deployed from the
+# public template. It stores rotating Monzo OAuth tokens.
+[[kv_namespaces]]
+binding = "MONZO"
