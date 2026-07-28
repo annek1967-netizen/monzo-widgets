@@ -38,24 +38,28 @@ jobs:
       - name: Download the latest worker
         run: |
           set -euo pipefail
+
+          # Unpacked outside the repository, not into it. The copy step below
+          # deletes anything at the destination that is not in the source, so a
+          # download sitting inside the destination is one rsync would delete
+          # while it was still reading from it.
           curl -fsSL \
             https://codeload.github.com/alixkyle/monzo-widgets/tar.gz/refs/heads/main \
-            -o upstream.tar.gz
-          mkdir upstream
-          tar -xzf upstream.tar.gz -C upstream --strip-components=1
+            -o "$RUNNER_TEMP/upstream.tar.gz"
+          mkdir "$RUNNER_TEMP/upstream"
+          tar -xzf "$RUNNER_TEMP/upstream.tar.gz" \
+            -C "$RUNNER_TEMP/upstream" --strip-components=1
 
           # Refuse to continue on a partial or unexpected download. Without
           # this check a failed fetch would let the copy step below delete the
           # whole Worker and push the result.
-          test -f upstream/worker/src/index.ts
-          test -f upstream/worker/package.json
+          test -f "$RUNNER_TEMP/upstream/worker/src/index.ts"
+          test -f "$RUNNER_TEMP/upstream/worker/package.json"
 
       - name: Copy it over this repository
         run: |
           set -euo pipefail
 
-          # Two deliberate exclusions:
-          #
           # wrangler.toml holds this Worker's name, which is what its
           # .workers.dev address is built from. Overwriting it could point
           # Cloudflare at a different Worker and strand the one the widgets
@@ -72,9 +76,7 @@ jobs:
             --exclude 'wrangler.local.toml' \
             --exclude '.dev.vars' \
             --exclude 'node_modules/' \
-            upstream/worker/ ./
-
-          rm -rf upstream upstream.tar.gz
+            "$RUNNER_TEMP/upstream/worker/" ./
 
       - name: Commit and push if anything changed
         run: |
