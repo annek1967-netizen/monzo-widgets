@@ -106,8 +106,11 @@ function handleVersion(): Response {
   );
 }
 
-const INSTALLER_URL =
-  "https://raw.githubusercontent.com/alixkyle/monzo-widgets/main/widget/money-installer.js";
+const RAW_BASE = "https://raw.githubusercontent.com/alixkyle/monzo-widgets/main";
+const INSTALLER_URL = `${RAW_BASE}/widget/money-installer.js`;
+const WORKFLOW_URL = `${RAW_BASE}/worker/.github/workflows/sync-upstream.yml`;
+const UPSTREAM_SOURCE_URL = `${RAW_BASE}/worker/src/index.ts`;
+const WORKFLOW_PATH = ".github/workflows/sync-upstream.yml";
 
 function escapeHtml(text: string): string {
   return text
@@ -117,13 +120,15 @@ function escapeHtml(text: string): string {
 }
 
 /**
- * Safari cannot reliably "Save to Files" a raw .js URL into Scriptable's iCloud
- * folder, so the page offers the installer as copyable text instead. Returns
- * null when GitHub is unreachable; the page then falls back to a plain link.
+ * Safari cannot reliably "Save to Files" a raw file into Scriptable's iCloud
+ * folder, and the same is true of adding a file to GitHub on a phone, so the
+ * page offers both the installer and the update workflow as copyable text.
+ * Returns null when GitHub is unreachable; each caller then degrades to a
+ * plain link rather than showing an empty box.
  */
-async function fetchInstaller(): Promise<string | null> {
+async function fetchText(url: string): Promise<string | null> {
   try {
-    const res = await fetch(INSTALLER_URL, {
+    const res = await fetch(url, {
       cf: { cacheTtl: 3600, cacheEverything: true },
     });
     if (!res.ok) return null;
@@ -133,12 +138,31 @@ async function fetchInstaller(): Promise<string | null> {
   }
 }
 
+/**
+ * The newest WORKER_VERSION published upstream, read from the source itself so
+ * there is only ever one number to bump.
+ *
+ * Returns null when GitHub is unreachable or the constant cannot be found, and
+ * the page then says nothing about freshness rather than claiming a Worker is
+ * out of date on the strength of a failed request.
+ */
+async function fetchLatestVersion(): Promise<number | null> {
+  const source = await fetchText(UPSTREAM_SOURCE_URL);
+  if (!source) return null;
+  const match = source.match(/^const WORKER_VERSION = (\d+);/m);
+  return match ? Number(match[1]) : null;
+}
+
 async function handleHome(url: URL, env: Env): Promise<Response> {
   const callback = `${url.origin}/auth/callback`;
-  const [connected, installerSource] = await Promise.all([
-    env.MONZO.get("refresh_token").then(Boolean),
-    fetchInstaller(),
-  ]);
+  const [connected, installerSource, workflowSource, latestVersion] =
+    await Promise.all([
+      env.MONZO.get("refresh_token").then(Boolean),
+      fetchText(INSTALLER_URL),
+      fetchText(WORKFLOW_URL),
+      fetchLatestVersion(),
+    ]);
+  const behind = latestVersion !== null && latestVersion > WORKER_VERSION;
   const nonce = crypto.randomUUID().replaceAll("-", "");
 
   return new Response(
@@ -171,13 +195,16 @@ async function handleHome(url: URL, env: Env): Promise<Response> {
     button.copied { background: #4bb78f; }
     a { color: #69d2ae; }
     small { display: block; color: #8fa3b8; line-height: 1.45; margin-top: .65rem; }
+    .version { margin: .75rem 0; padding: .7rem .9rem; border-radius: .7rem; font-size: .85rem; font-weight: 700; }
+    .version.fresh { background: #164c3d; color: #d7f2e7; }
+    .version.stale { background: #6b3410; color: #ffe2c9; }
   </style>
 </head>
 <body>
 <main>
   <div class="mark"></div>
   <h1>Monzo Widgets</h1>
-  <p>Your private widget service is running. Complete these four steps in order.</p>
+  <p>Your private widget service is running. Complete these five steps in order.</p>
   <div class="status">${connected ? "✓ Monzo is connected" : "Monzo is not connected yet"}</div>
 
   <section class="step">
@@ -216,6 +243,34 @@ async function handleHome(url: URL, env: Env): Promise<Response> {
         : `<p>The installer could not be loaded just now. Open this link, copy everything,
     then paste it into a new Scriptable script.</p>
     <a class="button" href="${INSTALLER_URL}">Open iPhone installer</a>`
+    }
+  </section>
+
+  <section class="step">
+    <span class="step-number">5</span><h2>Turn on automatic updates</h2>
+    <div class="version ${behind ? "stale" : "fresh"}">${
+      latestVersion === null
+        ? `Running version ${WORKER_VERSION}. The latest version could not be checked just now.`
+        : behind
+          ? `Update available — this service is on version ${WORKER_VERSION}, the latest is ${latestVersion}.`
+          : `✓ Up to date (version ${WORKER_VERSION})`
+    }</div>
+    <p>When you deployed this, GitHub made your own copy of the project. Adding
+    the file below to that copy keeps this service updating itself, so new
+    widgets always have something that understands them.</p>
+    ${
+      workflowSource
+        ? `<textarea id="workflow-source" readonly>${escapeHtml(workflowSource)}</textarea>
+    <button type="button" data-copy="workflow-source">Copy the auto-update file</button>
+    <small>Then open your copy of <strong>monzo-widgets</strong> on github.com,
+    tap <strong>Add file → Create new file</strong>, name it exactly
+    <strong>${WORKFLOW_PATH}</strong>, paste, and commit. Check the
+    <strong>Actions</strong> tab afterwards and tap the enable button if one
+    appears — GitHub keeps new workflows switched off until you approve them.
+    <br><br>Already added it? Then there is nothing to do; it updates once a
+    day on its own.</small>`
+        : `<p>The file could not be loaded just now.</p>
+    <a class="button" href="${WORKFLOW_URL}">Open the auto-update file</a>`
     }
   </section>
   <script nonce="${nonce}">
