@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "node scripts/deploy.mjs",
+    "bundle": "esbuild src/index.ts --bundle --format=esm --target=es2022 --banner:js=\"// Built from src/ by npm run bundle. Do not edit.\" --outfile=paste-into-cloudflare.js",
     "typecheck": "tsc --noEmit",
     "tail": "wrangler tail"
   },
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260726.1",
+    "esbuild": "^0.25.0",
     "typescript": "^5.7.2",
     "wrangler": "^4.114.0"
   }
